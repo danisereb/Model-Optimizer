@@ -16,6 +16,7 @@
 """Utils for quantization including scaling factors adjustments."""
 
 import logging
+import math
 from collections.abc import Generator
 from types import SimpleNamespace
 from typing import Any
@@ -54,6 +55,7 @@ from .model_config import (
     QUANTIZATION_INT8_SQ,
     QUANTIZATION_INT8_WO,
     QUANTIZATION_MXFP4,
+    QUANTIZATION_MXFP8,
     QUANTIZATION_NONE,
     QUANTIZATION_NVFP4,
     QUANTIZATION_NVFP4_AWQ,
@@ -290,6 +292,37 @@ def get_weight_scaling_factor(module: nn.Module, weight_name: str = "weight") ->
         return MXFP4QTensor.quantize(weight, block_size=weight_quantizer.block_sizes[-1])[
             1
         ].reshape(*weight.shape[:-1], -1)
+    if quantization_format == QUANTIZATION_MXFP8:
+        # MXFP8 uses dynamic block quantization similar to FP8_PB_WO
+        # The scaling factor is computed per block dynamically for 2D blocks
+        # Scale shape should be [out_dim // block_size, in_dim // block_size]
+        block_size = weight_quantizer.block_sizes[-1]
+        out_dim, in_dim = weight.shape[-2], weight.shape[-1]
+        expected_shape = (out_dim // block_size, in_dim // block_size)
+        
+        if hasattr(weight_quantizer, "_scale") and weight_quantizer._scale is not None:
+            scale = weight_quantizer._scale
+            # Ensure scale shape matches block structure
+            if scale.shape != expected_shape:
+                if scale.numel() == math.prod(expected_shape):
+                    scale = scale.reshape(expected_shape)
+                else:
+                    # If scale doesn't match, recompute from weight
+                    weight_reshaped = weight.view(*expected_shape, block_size, block_size)
+                    # Compute amax per block: max over both block dimensions
+                    amax = weight_reshaped.abs().max(dim=-1)[0].max(dim=-1)[0]
+                    maxbound = 448.0  # E4M3 maxbound
+                    scale = amax / maxbound
+            return scale
+        
+        # Compute from weight tensor per block for 2D block structure
+        weight_reshaped = weight.view(*expected_shape, block_size, block_size)
+        # Compute amax per block: max over both block dimensions -> [out_blocks, in_blocks]
+        # First max over the last dimension (block_size), then over the second-to-last (block_size)
+        amax = weight_reshaped.abs().max(dim=-1)[0].max(dim=-1)[0]
+        # MXFP8 uses E4M3 format with maxbound of 448.0
+        maxbound = 448.0
+        return amax / maxbound
     return get_scaling_factor(weight_quantizer)
 
 
@@ -474,6 +507,14 @@ def get_quantization_format(module) -> str | None:
         if weight_quantizer.num_bits == (4, 3):
             if weight_quantizer.block_sizes:
                 assert weight_quantizer.block_sizes[-1] > 0, "Invalid block_sizes for FP8 quantizer"
+                # Check if this is MXFP8 (dynamic block quantization with scale_bits (8, 0))
+                block_sizes = getattr(weight_quantizer, "block_sizes")
+                if (
+                    isinstance(block_sizes, dict)
+                    and block_sizes.get("type", "static") == "dynamic"
+                    and block_sizes.get("scale_bits") == (8, 0)
+                ):
+                    return QUANTIZATION_MXFP8
                 if weight_quantizer.fake_quant:
                     return QUANTIZATION_FP8_PB_WO
                 else:
@@ -772,6 +813,47 @@ def to_quantized_weight(
 
     if quantization in [QUANTIZATION_INT8_SQ, QUANTIZATION_INT8_WO]:
         return (weight / weights_scaling_factor[:, None]).round().clamp(-128, 127).to(torch.int8)
+
+    if quantization == QUANTIZATION_MXFP8:
+        # MXFP8 uses dynamic block quantization with FP8
+        # Similar to FP8_PB_WO but with dynamic scaling
+        if weights_scaling_factor is None:
+            # Compute scaling factor if not provided
+            if block_size is None:
+                block_size = 32
+            # Compute per-block amax for 2D block structure
+            # Expected scale shape: [out_dim // block_size, in_dim // block_size]
+            out_dim, in_dim = weight.shape[-2], weight.shape[-1]
+            out_blocks = out_dim // block_size
+            in_blocks = in_dim // block_size
+            
+            # Reshape to [out_blocks, block_size, in_blocks, block_size]
+            weight_reshaped = weight.view(out_blocks, block_size, in_blocks, block_size)
+            # Compute amax per block: max over both block dimensions -> [out_blocks, in_blocks]
+            # First max over the last dimension (block_size), then over dimension -2 (block_size)
+            amax = weight_reshaped.abs().max(dim=-1)[0].max(dim=-2)[0]
+            maxbound = 448.0  # E4M3 maxbound
+            weights_scaling_factor = amax / maxbound
+        else:
+            # Ensure weights_scaling_factor has correct shape for 2D block structure
+            if block_size is None:
+                block_size = 32
+            out_dim, in_dim = weight.shape[-2], weight.shape[-1]
+            expected_shape = (out_dim // block_size, in_dim // block_size)
+            # Reshape if needed (same number of elements but wrong shape)
+            if weights_scaling_factor.shape != expected_shape:
+                if weights_scaling_factor.numel() == math.prod(expected_shape):
+                    weights_scaling_factor = weights_scaling_factor.reshape(expected_shape)
+                else:
+                    # If shape doesn't match, recompute from weight
+                    weight_reshaped = weight.view(*expected_shape, block_size, block_size)
+                    # Compute amax per block: max over both block dimensions
+                    amax = weight_reshaped.abs().max(dim=-1)[0].max(dim=-1)[0]
+                    maxbound = 448.0
+                    weights_scaling_factor = amax / maxbound
+        return FP8QTensor.quantize(
+            weight, weights_scaling_factor, block_sizes={-1: block_size, -2: block_size}
+        )[0]._quantized_data
 
     if quantization == QUANTIZATION_FP8_PB_WO:
         return FP8QTensor.quantize(

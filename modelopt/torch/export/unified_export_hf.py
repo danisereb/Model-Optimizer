@@ -51,6 +51,7 @@ from .model_config import (
     QUANTIZATION_FP8,
     QUANTIZATION_FP8_PB_REAL,
     QUANTIZATION_FP8_PC_PT,
+    QUANTIZATION_MXFP8,
     QUANTIZATION_NONE,
     QUANTIZATION_NVFP4,
     QUANTIZATION_NVFP4_AWQ,
@@ -295,6 +296,19 @@ def _export_quantized_weight(
                 weight_quantizer._scale.to(torch.float32),
             )
             del weight_quantizer._scale
+        elif quantization_format == QUANTIZATION_MXFP8:
+            # MXFP8 uses dynamic block quantization, check if _scale exists
+            if hasattr(weight_quantizer, "_scale") and weight_quantizer._scale is not None:
+                sub_module.register_buffer(
+                    quantizer_attrs.weight_scale,
+                    weight_quantizer._scale.to(torch.float32),
+                )
+                del weight_quantizer._scale
+            else:
+                # Compute scaling factor from amax or weight
+                sub_module.register_buffer(
+                    quantizer_attrs.weight_scale, get_weight_scaling_factor(sub_module, weight_name)
+                )
         else:
             sub_module.register_buffer(
                 quantizer_attrs.weight_scale, get_weight_scaling_factor(sub_module, weight_name)
