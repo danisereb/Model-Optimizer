@@ -31,6 +31,7 @@ from modelopt.torch.quantization.nn.modules.quant_linear import RealQuantLinear
 from modelopt.torch.quantization.qtensor import (
     FP8QTensor,
     MXFP4QTensor,
+    MXFP8QTensor,
     NVFP4QTensor,
     QTensorWrapper,
 )
@@ -292,37 +293,9 @@ def get_weight_scaling_factor(module: nn.Module, weight_name: str = "weight") ->
         return MXFP4QTensor.quantize(weight, block_size=weight_quantizer.block_sizes[-1])[
             1
         ].reshape(*weight.shape[:-1], -1)
+
     if quantization_format == QUANTIZATION_MXFP8:
-        # MXFP8 uses dynamic block quantization similar to FP8_PB_WO
-        # The scaling factor is computed per block dynamically for 2D blocks
-        # Scale shape should be [out_dim // block_size, in_dim // block_size]
-        block_size = weight_quantizer.block_sizes[-1]
-        out_dim, in_dim = weight.shape[-2], weight.shape[-1]
-        expected_shape = (out_dim // block_size, in_dim // block_size)
-        
-        if hasattr(weight_quantizer, "_scale") and weight_quantizer._scale is not None:
-            scale = weight_quantizer._scale
-            # Ensure scale shape matches block structure
-            if scale.shape != expected_shape:
-                if scale.numel() == math.prod(expected_shape):
-                    scale = scale.reshape(expected_shape)
-                else:
-                    # If scale doesn't match, recompute from weight
-                    weight_reshaped = weight.view(*expected_shape, block_size, block_size)
-                    # Compute amax per block: max over both block dimensions
-                    amax = weight_reshaped.abs().max(dim=-1)[0].max(dim=-1)[0]
-                    maxbound = 448.0  # E4M3 maxbound
-                    scale = amax / maxbound
-            return scale
-        
-        # Compute from weight tensor per block for 2D block structure
-        weight_reshaped = weight.view(*expected_shape, block_size, block_size)
-        # Compute amax per block: max over both block dimensions -> [out_blocks, in_blocks]
-        # First max over the last dimension (block_size), then over the second-to-last (block_size)
-        amax = weight_reshaped.abs().max(dim=-1)[0].max(dim=-1)[0]
-        # MXFP8 uses E4M3 format with maxbound of 448.0
-        maxbound = 448.0
-        return amax / maxbound
+        return MXFP8QTensor.get_weights_scaling_factor_from_quantizer(weight, weight_quantizer)
     return get_scaling_factor(weight_quantizer)
 
 
@@ -710,6 +683,11 @@ def process_layer_quant_config(layer_config_dict):
                 "quant_algo": "W4A8_MXFP4_FP8",
                 "group_size": block_size_value,
             }
+        elif v == "mxfp8":
+            layer_config = {
+                "quant_algo": "MXFP8",
+                "group_size": block_size_value,
+            }
         else:
             layer_config = {"quant_algo": v}
 
@@ -779,6 +757,56 @@ def pack_int4_in_uint8(weight, weights_scaling_factor):
         return packed_byte.T.contiguous().view(torch.uint8)
 
 
+def _quantize_weight_mxfp8(
+    weight: torch.Tensor,
+    weights_scaling_factor: torch.Tensor,
+) -> torch.Tensor:
+    """Quantize weight tensor using MXFP8 format.
+
+    MXFP8 uses dynamic block quantization with FP8 (E4M3) along dimension -1 only (1D blocking).
+    Scales are E8M0 format (power-of-2 only), stored as biased uint8 exponents.
+    """
+    assert weights_scaling_factor is not None, (
+        "weights_scaling_factor must be provided for MXFP8 quantization."
+    )
+
+    # MXFP8 block size is 32
+    block_size = 32
+    maxbound = torch.finfo(torch.float8_e4m3fn).max  # 448.0
+
+    out_dim, in_dim = weight.shape[-2], weight.shape[-1]
+    expected_shape = (out_dim, in_dim // block_size)
+
+    # Reshape scaling factor if needed (same number of elements but wrong shape)
+    if weights_scaling_factor.shape != expected_shape:
+        if weights_scaling_factor.numel() == math.prod(expected_shape):
+            weights_scaling_factor = weights_scaling_factor.reshape(expected_shape)
+
+    # Handle E8M0 uint8 scale format (biased exponent)
+    if weights_scaling_factor.dtype == torch.uint8:
+        # E8M0 format: descale = 2^(exponent - 127), scale = 2^(127 - exponent)
+        scale_factor = torch.exp2(127 - weights_scaling_factor.float())
+    else:
+        # Legacy float32 scale format: scale = amax / maxbound
+        # Convert to E8M0: exponent = ceil(log2(scale))
+        e8m0_exponent = torch.ceil(torch.log2(weights_scaling_factor.clamp(min=2**-127)))
+        e8m0_exponent = torch.clamp(e8m0_exponent, min=-127, max=127)
+        scale_factor = torch.exp2(-e8m0_exponent)
+
+    # Reshape weight to [out_dim, num_blocks, block_size]
+    num_blocks = in_dim // block_size
+    weight_reshaped = weight.view(out_dim, num_blocks, block_size)
+
+    # Apply scale and quantize to FP8 E4M3
+    scale_factor_expanded = scale_factor.unsqueeze(-1)
+    scaled_weight = weight_reshaped * scale_factor_expanded
+    scaled_weight = torch.clamp(scaled_weight, min=-maxbound, max=maxbound)
+    quantized_weight = scaled_weight.to(torch.float8_e4m3fn)
+
+    # Reshape back to original 2D shape
+    return quantized_weight.view(out_dim, in_dim)
+
+
 def to_quantized_weight(
     weight: torch.Tensor,
     weights_scaling_factor: torch.Tensor,
@@ -815,45 +843,7 @@ def to_quantized_weight(
         return (weight / weights_scaling_factor[:, None]).round().clamp(-128, 127).to(torch.int8)
 
     if quantization == QUANTIZATION_MXFP8:
-        # MXFP8 uses dynamic block quantization with FP8
-        # Similar to FP8_PB_WO but with dynamic scaling
-        if weights_scaling_factor is None:
-            # Compute scaling factor if not provided
-            if block_size is None:
-                block_size = 32
-            # Compute per-block amax for 2D block structure
-            # Expected scale shape: [out_dim // block_size, in_dim // block_size]
-            out_dim, in_dim = weight.shape[-2], weight.shape[-1]
-            out_blocks = out_dim // block_size
-            in_blocks = in_dim // block_size
-            
-            # Reshape to [out_blocks, block_size, in_blocks, block_size]
-            weight_reshaped = weight.view(out_blocks, block_size, in_blocks, block_size)
-            # Compute amax per block: max over both block dimensions -> [out_blocks, in_blocks]
-            # First max over the last dimension (block_size), then over dimension -2 (block_size)
-            amax = weight_reshaped.abs().max(dim=-1)[0].max(dim=-2)[0]
-            maxbound = 448.0  # E4M3 maxbound
-            weights_scaling_factor = amax / maxbound
-        else:
-            # Ensure weights_scaling_factor has correct shape for 2D block structure
-            if block_size is None:
-                block_size = 32
-            out_dim, in_dim = weight.shape[-2], weight.shape[-1]
-            expected_shape = (out_dim // block_size, in_dim // block_size)
-            # Reshape if needed (same number of elements but wrong shape)
-            if weights_scaling_factor.shape != expected_shape:
-                if weights_scaling_factor.numel() == math.prod(expected_shape):
-                    weights_scaling_factor = weights_scaling_factor.reshape(expected_shape)
-                else:
-                    # If shape doesn't match, recompute from weight
-                    weight_reshaped = weight.view(*expected_shape, block_size, block_size)
-                    # Compute amax per block: max over both block dimensions
-                    amax = weight_reshaped.abs().max(dim=-1)[0].max(dim=-1)[0]
-                    maxbound = 448.0
-                    weights_scaling_factor = amax / maxbound
-        return FP8QTensor.quantize(
-            weight, weights_scaling_factor, block_sizes={-1: block_size, -2: block_size}
-        )[0]._quantized_data
+        return _quantize_weight_mxfp8(weight, weights_scaling_factor)
 
     if quantization == QUANTIZATION_FP8_PB_WO:
         return FP8QTensor.quantize(
