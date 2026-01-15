@@ -671,7 +671,8 @@ class TensorQuantizer(nn.Module):
                 buffer_to_register["_scale"] = scales
             else:
                 raise ValueError(
-                    f"Real quantization for MX {self._num_bits} format is not supported."
+                    f"Unsupported MX format: num_bits={self._num_bits}. "
+                    f"Expected (2, 1) for MXFP4 or (4, 3) for MXFP8."
                 )
         elif self._num_bits == (4, 3):
             # FP8 quantization (non-MX)
