@@ -132,15 +132,6 @@ class MXFP8QTensor(BaseQuantizedTensor):
             assert scale.dtype == cls.SCALE_DTYPE, (
                 f"MXFP8 scale must be {cls.SCALE_DTYPE} (E8M0 format), got {scale.dtype}"
             )
-
-            # Reshape if needed (same number of elements but wrong shape)
-            if scale.shape != expected_shape:
-                expected_numel = 1
-                for dim in expected_shape:
-                    expected_numel *= dim
-                if scale.numel() == expected_numel:
-                    scale = scale.reshape(expected_shape)
-
             assert scale.shape == expected_shape, (
                 f"Scale shape {scale.shape} does not match expected shape {expected_shape}"
             )
@@ -178,12 +169,6 @@ class MXFP8QTensor(BaseQuantizedTensor):
         assert in_dim % cls.BLOCK_SIZE == 0, (
             f"Weight inner dimension ({in_dim}) must be divisible by MXFP8 block size ({cls.BLOCK_SIZE})"
         )
-
-        # Reshape scale if needed (same number of elements but wrong shape)
-        expected_shape = (*weight.shape[:-1], num_blocks)
-        if e8m0_scale.shape != expected_shape:
-            if e8m0_scale.numel() == weight.numel() // cls.BLOCK_SIZE:
-                e8m0_scale = e8m0_scale.reshape(expected_shape)
 
         # Convert E8M0 biased exponent to scale factor: scale = 2^(127 - exponent)
         scale_factor = torch.exp2(127 - e8m0_scale.float())
@@ -257,13 +242,6 @@ class MXFP8QTensor(BaseQuantizedTensor):
 
         # Convert E8M0 biased exponent back to scale factor: descale = 2^(exponent - 127)
         descale = torch.exp2(e8m0_scale.float() - 127)
-
-        # Reshape descale to match blocked tensor for broadcasting
-        expected_scale_shape = (*quantized_data.shape[:-1], num_blocks)
-        if descale.shape != expected_scale_shape and descale.numel() == num_blocks * (
-            quantized_data.numel() // quantized_data.shape[-1]
-        ):
-            descale = descale.view(expected_scale_shape)
 
         dequantized = quantized_blocked * descale.unsqueeze(-1)
 
