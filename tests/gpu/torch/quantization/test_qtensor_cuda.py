@@ -897,3 +897,15 @@ class TestQTensor:
 
         with pytest.raises(AssertionError, match="Scale shape .* does not match expected shape"):
             MXFP8QTensor.get_weights_scaling_factor_from_quantizer(weight, quantizer)
+
+    @pytest.mark.parametrize("device", ["cuda"])
+    @pytest.mark.parametrize("input_dtype", [torch.float32, torch.float16, torch.bfloat16])
+    def test_mxfp8_dequantize_default_dtype(self, device, input_dtype):
+        """Test dequantize uses original dtype when dtype=None."""
+        input_tensor = torch.randn(64, 64, dtype=input_dtype, device=device)
+        qtensor, e8m0_scale = MXFP8QTensor.quantize(input_tensor)
+
+        # Dequantize without specifying dtype
+        dequant = qtensor.dequantize(scale=e8m0_scale)
+
+        assert dequant.dtype == input_dtype
