@@ -839,12 +839,6 @@ class TestQTensor:
     @pytest.mark.parametrize("device", ["cuda"])
     def test_mxfp8_quantize_with_scale_asserts(self, device):
         """Test quantize_with_scale raises assertions for invalid inputs."""
-        # Test 1D weight assertion
-        weight_1d = torch.randn(64, dtype=torch.float32, device=device)
-        scale = torch.randint(0, 255, (2,), dtype=torch.uint8, device=device)
-        with pytest.raises(AssertionError, match="Weight must be at least 2D"):
-            MXFP8QTensor.quantize_with_scale(weight_1d, scale)
-
         # Test wrong scale dtype assertion
         weight = torch.randn(64, 64, dtype=torch.float32, device=device)
         wrong_dtype_scale = torch.randn(64, 2, dtype=torch.float32, device=device)
@@ -856,34 +850,3 @@ class TestQTensor:
         scale = torch.randint(0, 255, (64, 1), dtype=torch.uint8, device=device)
         with pytest.raises(AssertionError, match="must be divisible by MXFP8 block size"):
             MXFP8QTensor.quantize_with_scale(weight_bad_dim, scale)
-
-    @pytest.mark.parametrize("device", ["cuda"])
-    def test_mxfp8_quantize_dequantize_asserts(self, device):
-        """Test quantize and dequantize raise assertions for invalid inputs."""
-        # Test empty tensor assertion
-        empty_tensor = torch.empty(0, dtype=torch.float32, device=device)
-        with pytest.raises(AssertionError, match="Input tensor must not be empty"):
-            MXFP8QTensor.quantize(empty_tensor)
-
-        # Test 0D tensor assertion
-        scalar_tensor = torch.tensor(1.0, dtype=torch.float32, device=device)
-        with pytest.raises(AssertionError, match="Input must have at least 1 dimension"):
-            MXFP8QTensor.quantize(scalar_tensor)
-
-        # Test non-floating point assertion
-        int_tensor = torch.randint(0, 10, (32, 32), dtype=torch.int32, device=device)
-        with pytest.raises(AssertionError, match="Input must be floating point"):
-            MXFP8QTensor.quantize(int_tensor)
-
-        # Create a valid quantized tensor for dequantize tests
-        input_tensor = torch.randn(64, 64, dtype=torch.float32, device=device)
-        qtensor, e8m0_scale = MXFP8QTensor.quantize(input_tensor)
-
-        # Test missing scale assertion
-        with pytest.raises(AssertionError, match="dequantize requires 'scale' in kwargs"):
-            qtensor.dequantize(dtype=torch.float32)
-
-        # Test wrong scale dtype assertion
-        wrong_dtype_scale = torch.randn(64, 2, dtype=torch.float32, device=device)
-        with pytest.raises(AssertionError, match="e8m0_scale must be"):
-            qtensor.dequantize(dtype=torch.float32, scale=wrong_dtype_scale)

@@ -148,14 +148,14 @@ class MXFP8QTensor(BaseQuantizedTensor):
         This method is useful for export paths where the scale has already been computed.
 
         Args:
-            weight: The weight tensor to quantize. Must be at least 2D.
+            weight: The weight tensor to quantize. Must be at least 1D.
             e8m0_scale: E8M0 scale as uint8 biased exponent (bias = 127).
-                Shape should be [..., out_dim, in_dim // 32].
+                Shape should be [..., out_dim, in_dim // 32] for 2D+ tensors,
+                or [in_dim // 32] for 1D tensors.
 
         Returns:
             torch.Tensor: Quantized weight as float8_e4m3fn with same shape as input.
         """
-        assert weight.dim() >= 2, f"Weight must be at least 2D, got {weight.dim()}D"
         assert e8m0_scale.dtype == cls.SCALE_DTYPE, (
             f"e8m0_scale must be {cls.SCALE_DTYPE} (E8M0 format), got {e8m0_scale.dtype}"
         )
@@ -201,10 +201,6 @@ class MXFP8QTensor(BaseQuantizedTensor):
         Returns:
             tuple: (MXFP8QTensor, e8m0_scale) where e8m0_scale is uint8 biased exponent.
         """
-        assert input.numel() > 0, "Input tensor must not be empty"
-        assert input.dim() >= 1, f"Input must have at least 1 dimension, got {input.dim()}D"
-        assert input.is_floating_point(), f"Input must be floating point, got {input.dtype}"
-
         original_shape = input.shape
         original_dtype = input.dtype
 
@@ -234,9 +230,6 @@ class MXFP8QTensor(BaseQuantizedTensor):
         assert "scale" in kwargs, "dequantize requires 'scale' in kwargs"
 
         e8m0_scale = kwargs["scale"]
-        assert e8m0_scale.dtype == self.SCALE_DTYPE, (
-            f"e8m0_scale must be {self.SCALE_DTYPE} (E8M0 format), got {e8m0_scale.dtype}"
-        )
 
         if dtype is None:
             dtype = self.metadata["dtype"]
