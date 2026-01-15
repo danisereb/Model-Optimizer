@@ -71,9 +71,12 @@ class MXFP8QTensor(BaseQuantizedTensor):
 
         Args:
             weight: The weight tensor to compute scale for. Must be at least 2D.
+                Supports 2D (out_dim, in_dim) and 3D MoE (num_experts, out_dim, in_dim).
 
         Returns:
             torch.Tensor: E8M0 scale as uint8 tensor with shape [..., out_dim, in_dim // 32].
+                For 2D input: (out_dim, in_dim // 32)
+                For 3D MoE input: (num_experts, out_dim, in_dim // 32)
         """
         assert weight.dim() >= 2, f"Weight must be at least 2D, got {weight.dim()}D"
 
@@ -83,7 +86,7 @@ class MXFP8QTensor(BaseQuantizedTensor):
             f"Weight inner dimension ({in_dim}) must be divisible by MXFP8 block size ({cls.BLOCK_SIZE})"
         )
 
-        # Compute amax per block (reduce_block_amax handles reshaping internally)
+        # Compute amax per block (reduce_block_amax handles N-dimensional tensors)
         amax = reduce_block_amax(weight, block_sizes={-1: cls.BLOCK_SIZE})
 
         # Compute E8M0 exponent and convert to biased uint8 (bias = 127)
@@ -102,11 +105,12 @@ class MXFP8QTensor(BaseQuantizedTensor):
         with proper format conversion and shape correction.
 
         Args:
-            weight: The weight tensor.
+            weight: The weight tensor. Can be 2D (out_dim, in_dim) or
+                3D for MoE (num_experts, out_dim, in_dim).
             weight_quantizer: The weight quantizer with block_sizes and optional _scale.
 
         Returns:
-            torch.Tensor: E8M0 scale as uint8 tensor with shape [out_dim, in_dim // 32].
+            torch.Tensor: E8M0 scale as uint8 tensor with shape [..., out_dim, in_dim // 32].
         """
         assert hasattr(weight_quantizer, "block_sizes"), (
             "weight_quantizer must have 'block_sizes' attribute"
@@ -116,8 +120,11 @@ class MXFP8QTensor(BaseQuantizedTensor):
         )
         assert weight.dim() >= 2, f"Weight must be at least 2D, got {weight.dim()}D"
 
-        out_dim, in_dim = weight.shape[-2], weight.shape[-1]
-        expected_shape = (out_dim, in_dim // cls.BLOCK_SIZE)
+        in_dim = weight.shape[-1]
+        # Expected scale shape: all dims except last, with last dim reduced by block size
+        # For 2D: (out_dim, in_dim // 32)
+        # For 3D MoE: (num_experts, out_dim, in_dim // 32)
+        expected_shape = (*weight.shape[:-1], in_dim // cls.BLOCK_SIZE)
 
         if hasattr(weight_quantizer, "_scale") and weight_quantizer._scale is not None:
             scale = weight_quantizer._scale
@@ -127,11 +134,16 @@ class MXFP8QTensor(BaseQuantizedTensor):
             )
 
             # Reshape if needed (same number of elements but wrong shape)
-            if (
-                scale.shape != expected_shape
-                and scale.numel() == expected_shape[0] * expected_shape[1]
-            ):
-                scale = scale.reshape(expected_shape)
+            if scale.shape != expected_shape:
+                expected_numel = 1
+                for dim in expected_shape:
+                    expected_numel *= dim
+                if scale.numel() == expected_numel:
+                    scale = scale.reshape(expected_shape)
+
+            assert scale.shape == expected_shape, (
+                f"Scale shape {scale.shape} does not match expected shape {expected_shape}"
+            )
             return scale
 
         # No scale in quantizer, compute from weight

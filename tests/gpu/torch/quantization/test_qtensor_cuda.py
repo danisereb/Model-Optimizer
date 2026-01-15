@@ -850,3 +850,50 @@ class TestQTensor:
         scale = torch.randint(0, 255, (64, 1), dtype=torch.uint8, device=device)
         with pytest.raises(AssertionError, match="must be divisible by MXFP8 block size"):
             MXFP8QTensor.quantize_with_scale(weight_bad_dim, scale)
+
+    @pytest.mark.parametrize("device", ["cuda"])
+    def test_mxfp8_get_weights_scaling_factor_from_quantizer_3d_moe(self, device):
+        """Test get_weights_scaling_factor_from_quantizer handles 3D MoE tensors."""
+        input_shape = (4, 64, 128)  # (num_experts, out_dim, in_dim)
+        weight = torch.randn(input_shape, dtype=torch.float32, device=device)
+
+        class MockQuantizer:
+            block_sizes = {-1: MXFP8QTensor.BLOCK_SIZE}
+            _scale = None
+
+        quantizer = MockQuantizer()
+
+        # Test when _scale is None (should compute from weight)
+        scale = MXFP8QTensor.get_weights_scaling_factor_from_quantizer(weight, quantizer)
+
+        expected_shape = (
+            input_shape[0],
+            input_shape[1],
+            input_shape[2] // MXFP8QTensor.BLOCK_SIZE,
+        )
+        assert scale.shape == expected_shape
+
+        # Test when _scale is provided with correct 3D shape
+        quantizer._scale = torch.randint(0, 255, expected_shape, dtype=torch.uint8, device=device)
+        scale_from_quantizer = MXFP8QTensor.get_weights_scaling_factor_from_quantizer(
+            weight, quantizer
+        )
+        assert torch.equal(scale_from_quantizer, quantizer._scale)
+
+    @pytest.mark.parametrize("device", ["cuda"])
+    def test_mxfp8_get_weights_scaling_factor_from_quantizer_scale_shape_mismatch(self, device):
+        """Test get_weights_scaling_factor_from_quantizer raises assertion on shape mismatch."""
+        input_shape = (4, 64, 128)  # (num_experts, out_dim, in_dim)
+        weight = torch.randn(input_shape, dtype=torch.float32, device=device)
+
+        class MockQuantizer:
+            block_sizes = {-1: MXFP8QTensor.BLOCK_SIZE}
+            # Wrong shape: 2D instead of 3D (missing num_experts dimension)
+            _scale = torch.randint(
+                0, 255, (64, 4), dtype=torch.uint8, device=device
+            )
+
+        quantizer = MockQuantizer()
+
+        with pytest.raises(AssertionError, match="Scale shape .* does not match expected shape"):
+            MXFP8QTensor.get_weights_scaling_factor_from_quantizer(weight, quantizer)
