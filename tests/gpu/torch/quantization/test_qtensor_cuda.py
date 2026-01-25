@@ -250,14 +250,6 @@ class TestQTensor:
                 torch.randn([512, 512], dtype=torch.float32),
                 None,
             ),
-            # MXFP8
-            (
-                (4, 3),
-                {-1: 32, "type": "dynamic", "scale_bits": (8, 0)},
-                None,
-                torch.randn([512, 512], dtype=torch.float32),
-                None,
-            ),
         ],
     )
     @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -909,3 +901,47 @@ class TestQTensor:
         dequant = qtensor.dequantize(scale=e8m0_scale)
 
         assert dequant.dtype == input_dtype
+
+    @pytest.mark.parametrize("device", ["cuda"])
+    @pytest.mark.parametrize("input_dtype", [torch.float32, torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize(
+        "input_shape",
+        [
+            (64, 64),
+            (128, 128),
+            (4, 64, 128),  # 3D MoE shape
+        ],
+    )
+    def test_mxfp8_fake_quant(self, device, input_dtype, input_shape):
+        """Test MXFP8 fake quantization via TensorQuantizer matches real quant+dequant."""
+        block_sizes = {-1: 32, "type": "dynamic", "scale_bits": (8, 0)}
+
+        # Create fake quant quantizer
+        fake_quant_cfg = QuantizerAttributeConfig(
+            num_bits=(4, 3), block_sizes=block_sizes, fake_quant=True, axis=None
+        )
+        fake_quantizer = TensorQuantizer(fake_quant_cfg).to(device)
+
+        # Create real quant quantizer
+        real_quant_cfg = QuantizerAttributeConfig(
+            num_bits=(4, 3), block_sizes=block_sizes, fake_quant=False, axis=None
+        )
+        real_quantizer = TensorQuantizer(real_quant_cfg).to(device)
+
+        # Test tensor
+        test_tensor = torch.randn(input_shape, dtype=input_dtype, device=device)
+
+        # Fake quant output
+        fake_quant_output = fake_quantizer(test_tensor)
+
+        # Real quant + dequant
+        q_tensor = real_quantizer(test_tensor)
+        real_dequant_output = real_quantizer(q_tensor)
+
+        # Verify fake quant matches real quant+dequant
+        assert fake_quant_output.shape == test_tensor.shape
+        assert fake_quant_output.dtype == test_tensor.dtype
+        assert torch.allclose(fake_quant_output, real_dequant_output, rtol=5e-2, atol=5e-2), (
+            f"Fake quant differs from real quant+dequant: "
+            f"max diff = {(fake_quant_output - real_dequant_output).abs().max()}"
+        )
