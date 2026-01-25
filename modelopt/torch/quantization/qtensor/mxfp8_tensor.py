@@ -144,7 +144,7 @@ class MXFP8QTensor(BaseQuantizedTensor):
     def quantize_with_scale(
         cls,
         weight: torch.Tensor,
-        e8m0_scale: torch.Tensor,
+        weights_scaling_factor: torch.Tensor,
     ) -> torch.Tensor:
         """Quantize weight tensor using a pre-computed E8M0 scale.
 
@@ -152,15 +152,16 @@ class MXFP8QTensor(BaseQuantizedTensor):
 
         Args:
             weight: The weight tensor to quantize. Must be at least 1D.
-            e8m0_scale: E8M0 scale as uint8 biased exponent (bias = 127).
+            weights_scaling_factor: E8M0 scale as uint8 biased exponent (bias = 127).
                 Shape should be [..., out_dim, in_dim // 32] for 2D+ tensors,
                 or [in_dim // 32] for 1D tensors.
 
         Returns:
             torch.Tensor: Quantized weight as float8_e4m3fn with same shape as input.
         """
-        assert e8m0_scale.dtype == cls.SCALE_DTYPE, (
-            f"e8m0_scale must be {cls.SCALE_DTYPE} (E8M0 format), got {e8m0_scale.dtype}"
+        assert weights_scaling_factor.dtype == cls.SCALE_DTYPE, (
+            f"weights_scaling_factor must be {cls.SCALE_DTYPE} (E8M0 format), "
+            f"got {weights_scaling_factor.dtype}"
         )
 
         in_dim = weight.shape[-1]
@@ -171,13 +172,13 @@ class MXFP8QTensor(BaseQuantizedTensor):
         )
 
         # Convert E8M0 biased exponent to scale factor: scale = 2^(127 - exponent)
-        scale_factor = torch.exp2(127 - e8m0_scale.float())
+        scale_factor = torch.exp2(127 - weights_scaling_factor.float())
 
         # NOTE: vLLM/flashinfer may require this behavior:
         # scale_factor = torch.where(
-        #    e8m0_scale == 0,
+        #    weights_scaling_factor == 0,
         #    1.0,
-        #    torch.exp2(127 - e8m0_scale.float())
+        #    torch.exp2(127 - weights_scaling_factor.float())
         # )
 
         weight_reshaped = weight.view(*weight.shape[:-1], num_blocks, cls.BLOCK_SIZE)
@@ -189,30 +190,39 @@ class MXFP8QTensor(BaseQuantizedTensor):
         return quantized_weight.view(weight.shape)
 
     @classmethod
-    def quantize(cls, input: torch.Tensor) -> tuple:
+    def quantize(
+        cls,
+        input: torch.Tensor,
+        weights_scaling_factor: torch.Tensor | None = None,
+    ) -> tuple:
         """Convert a tensor to MXFP8 quantized format.
 
         Args:
             input (torch.Tensor): The input tensor to be quantized.
+            weights_scaling_factor (torch.Tensor | None): Optional pre-computed E8M0 scale
+                as uint8 biased exponent. If None, the scale will be computed from the input.
+                Shape should be [..., in_dim // 32] matching input dimensions.
 
         Returns:
-            tuple: (MXFP8QTensor, e8m0_scale) where e8m0_scale is uint8 biased exponent.
+            tuple: (MXFP8QTensor, weights_scaling_factor) where weights_scaling_factor is
+                E8M0 scale as uint8 biased exponent.
         """
         original_shape = input.shape
         original_dtype = input.dtype
 
         input = reduce_block_padding(input, block_sizes={-1: cls.BLOCK_SIZE})
-        input_amax = reduce_block_amax(input, block_sizes={-1: cls.BLOCK_SIZE})
 
-        e8m0_exponent = cls._compute_e8m0_exponent(input_amax)
-        e8m0_scale = (e8m0_exponent + 127).to(cls.SCALE_DTYPE)
+        if weights_scaling_factor is None:
+            input_amax = reduce_block_amax(input, block_sizes={-1: cls.BLOCK_SIZE})
+            e8m0_exponent = cls._compute_e8m0_exponent(input_amax)
+            weights_scaling_factor = (e8m0_exponent + 127).to(cls.SCALE_DTYPE)
 
-        quantized_data = cls.quantize_with_scale(input, e8m0_scale)
+        quantized_data = cls.quantize_with_scale(input, weights_scaling_factor)
 
         # Crop back to original shape
         quantized_data = quantized_data[..., : original_shape[-1]]
 
-        return cls(original_shape, original_dtype, quantized_data), e8m0_scale
+        return cls(original_shape, original_dtype, quantized_data), weights_scaling_factor
 
     def dequantize(self, dtype: torch.dtype = None, **kwargs) -> torch.Tensor:
         """Dequantize MXFP8 tensor back to the target dtype.

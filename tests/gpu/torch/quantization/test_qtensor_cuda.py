@@ -797,6 +797,50 @@ class TestQTensor:
         # Note: 255 (0xFF) represents NaN in E8M0 and should never appear from valid weights
         assert torch.all(e8m0_scale <= 254), "E8M0 scale contains NaN value (255)"
 
+    @pytest.mark.parametrize("device", ["cuda", "cpu"])
+    @pytest.mark.parametrize("input_dtype", [torch.float32, torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize(
+        "input_shape",
+        [
+            (64, 64),
+            (128, 128),
+            (4, 64, 128),  # 3D MoE shape
+            # Note: All shapes must have last dim divisible by 32 since
+            # get_weights_scaling_factor() requires this (unlike quantize() which pads)
+        ],
+    )
+    def test_mxfp8_quantize_with_precomputed_scale(self, device, input_dtype, input_shape):
+        """Test MXFP8 quantize() with pre-computed weights_scaling_factor."""
+        test_tensor = torch.randn(input_shape, dtype=input_dtype, device=device)
+
+        # Quantize without pre-computed scale (baseline)
+        qtensor_auto, scale_auto = MXFP8QTensor.quantize(test_tensor)
+
+        # Pre-compute scale and pass to quantize
+        precomputed_scale = MXFP8QTensor.get_weights_scaling_factor(test_tensor)
+        qtensor_precomputed, scale_precomputed = MXFP8QTensor.quantize(
+            test_tensor, weights_scaling_factor=precomputed_scale
+        )
+
+        # Verify scales match
+        assert torch.equal(scale_auto, scale_precomputed), (
+            "Pre-computed scale should match auto-computed scale"
+        )
+
+        # Verify quantized data matches
+        assert torch.equal(qtensor_auto._quantized_data, qtensor_precomputed._quantized_data), (
+            "Quantized data should match when using pre-computed scale"
+        )
+
+        # Verify dequantized results match
+        dequant_auto = qtensor_auto.dequantize(dtype=input_dtype, scale=scale_auto)
+        dequant_precomputed = qtensor_precomputed.dequantize(
+            dtype=input_dtype, scale=scale_precomputed
+        )
+        assert torch.equal(dequant_auto, dequant_precomputed), (
+            "Dequantized results should match"
+        )
+
     @pytest.mark.parametrize(
         ("amax_value", "expected_exponent"),
         [
@@ -834,7 +878,7 @@ class TestQTensor:
         # Test wrong scale dtype assertion
         weight = torch.randn(64, 64, dtype=torch.float32, device=device)
         wrong_dtype_scale = torch.randn(64, 2, dtype=torch.float32, device=device)
-        with pytest.raises(AssertionError, match="e8m0_scale must be"):
+        with pytest.raises(AssertionError, match="weights_scaling_factor must be"):
             MXFP8QTensor.quantize_with_scale(weight, wrong_dtype_scale)
 
         # Test non-divisible dimension assertion
