@@ -588,13 +588,19 @@ class GPTModelExporter:
         if weight_scale is None:
             self._state_dict[prefix + "weight"] = weight
         else:
-            self._state_dict[prefix + "weight"] = to_quantized_weight(
+            result = to_quantized_weight(
                 weight,
                 weight_scale,
                 qformat,
                 weight_scale_2,
                 block_size,
             )
+            # Handle MXFP8 which returns (weight, scale) tuple to ensure consistency
+            if isinstance(result, tuple):
+                quantized_weight, weight_scale = result
+            else:
+                quantized_weight = result
+            self._state_dict[prefix + "weight"] = quantized_weight
             self._state_dict[prefix + "weight_scale"] = weight_scale.detach().clone()
 
         if weight_scale_2 is not None:
@@ -634,20 +640,31 @@ class GPTModelExporter:
             else:
                 gate_proj_weight_scale = weight_scale[:ffn_hidden_size]
                 up_proj_weight_scale = weight_scale[ffn_hidden_size:]
-            self._state_dict[gate_proj_prefix + "weight"] = to_quantized_weight(
+            result_gate = to_quantized_weight(
                 gate_proj_weight,
                 gate_proj_weight_scale,
                 qformat,
                 weight_scale_2,
                 block_size,
             )
-            self._state_dict[up_proj_prefix + "weight"] = to_quantized_weight(
+            result_up = to_quantized_weight(
                 up_proj_weight,
                 up_proj_weight_scale,
                 qformat,
                 weight_scale_2,
                 block_size,
             )
+            # Handle MXFP8 which returns (weight, scale) tuple to ensure consistency
+            if isinstance(result_gate, tuple):
+                gate_quant_weight, gate_proj_weight_scale = result_gate
+            else:
+                gate_quant_weight = result_gate
+            if isinstance(result_up, tuple):
+                up_quant_weight, up_proj_weight_scale = result_up
+            else:
+                up_quant_weight = result_up
+            self._state_dict[gate_proj_prefix + "weight"] = gate_quant_weight
+            self._state_dict[up_proj_prefix + "weight"] = up_quant_weight
             self._state_dict[gate_proj_prefix + "weight_scale"] = gate_proj_weight_scale
             self._state_dict[up_proj_prefix + "weight_scale"] = up_proj_weight_scale
 
@@ -752,14 +769,22 @@ class GPTModelExporter:
                     weight_scale.detach().clone(),
                 ]
 
-            for weight, scale, key in zip(proj_weights, proj_weight_scales, proj_keys):
-                quantized_weight = to_quantized_weight(
+            for i, (weight, scale, key) in enumerate(
+                zip(proj_weights, proj_weight_scales, proj_keys)
+            ):
+                result = to_quantized_weight(
                     weight,
                     scale,
                     qformat,
                     weight_scale_2,
                     block_size,
                 )
+                # Handle MXFP8 which returns (weight, scale) tuple to ensure consistency
+                if isinstance(result, tuple):
+                    quantized_weight, scale = result
+                    proj_weight_scales[i] = scale  # Update for scale_2 loop below
+                else:
+                    quantized_weight = result
                 self._state_dict[key] = quantized_weight
                 self._state_dict[key + "_scale"] = scale
 
@@ -842,13 +867,19 @@ class GPTModelExporter:
         if merged_weight_scale is None:
             self._state_dict[prefix] = merged_weight
         else:
-            self._state_dict[prefix] = to_quantized_weight(
+            result = to_quantized_weight(
                 merged_weight,
                 merged_weight_scale,
                 qformat,
                 merged_weight_scale_2,
                 block_size,
             )
+            # Handle MXFP8 which returns (weight, scale) tuple to ensure consistency
+            if isinstance(result, tuple):
+                quantized_weight, merged_weight_scale = result
+            else:
+                quantized_weight = result
+            self._state_dict[prefix] = quantized_weight
             self._state_dict[prefix + "_weight_scale"] = merged_weight_scale
             if merged_weight_scale_2 is not None:
                 self._state_dict[prefix + "_weight_scale_2"] = merged_weight_scale_2
@@ -951,13 +982,19 @@ class GPTModelExporter:
             # TODO: May need to modify the key name later.
             self._state_dict[prefix] = merged_weight
         else:
-            self._state_dict[prefix] = to_quantized_weight(
+            result = to_quantized_weight(
                 merged_weight,
                 merged_weight_scale,
                 qformat,
                 merged_weight_scale_2,
                 block_size,
             )
+            # Handle MXFP8 which returns (weight, scale) tuple to ensure consistency
+            if isinstance(result, tuple):
+                quantized_weight, merged_weight_scale = result
+            else:
+                quantized_weight = result
+            self._state_dict[prefix] = quantized_weight
             self._state_dict[prefix + "_weight_scale"] = merged_weight_scale
             if merged_weight_scale_2 is not None:
                 self._state_dict[prefix + "_weight_scale_2"] = merged_weight_scale_2

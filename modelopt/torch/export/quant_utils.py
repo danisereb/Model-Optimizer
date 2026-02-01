@@ -847,7 +847,11 @@ def to_quantized_weight(
         return (weight / weights_scaling_factor[:, None]).round().clamp(-128, 127).to(torch.int8)
 
     if quantization == QUANTIZATION_MXFP8:
-        return MXFP8QTensor.quantize_with_scale(weight, weights_scaling_factor)
+        # quantize_with_scale returns (fp8_weight, scale) tuple to ensure
+        # the FP8 values and scale are always consistent (from same FlashInfer call)
+        fp8_weight, updated_scale = MXFP8QTensor.quantize_with_scale(weight, weights_scaling_factor)
+        # Return tuple for MXFP8 - caller must handle this and update the scale
+        return fp8_weight, updated_scale
 
     if quantization == QUANTIZATION_FP8_PB_WO:
         return FP8QTensor.quantize(

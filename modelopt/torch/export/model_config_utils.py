@@ -324,13 +324,19 @@ def pack_linear_weights(model_config: ModelConfig):
 
                 # Save the quantize layer weights to cpu and save gpu memory.
                 if linear_layer.weight.element_size() > 1:
-                    linear_layer.weight = to_quantized_weight(
+                    result = to_quantized_weight(
                         linear_layer.weight,
                         linear_layer.weights_scaling_factor,
                         linear_layer.quantization,
                         linear_layer.weights_scaling_factor_2,
                         linear_layer.awq_block_size,
-                    ).cpu()
+                    )
+                    # Handle MXFP8 which returns (weight, scale) tuple to ensure consistency
+                    if isinstance(result, tuple):
+                        linear_layer.weight = result[0].cpu()
+                        linear_layer.weights_scaling_factor = result[1]
+                    else:
+                        linear_layer.weight = result.cpu()
 
                 # Convert to int8 if to make the checkpoint compatible with the latest TensorRT-LLM release.
                 # The future TensorRT-LLM release will use uint8 weights instead.

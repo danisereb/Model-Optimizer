@@ -492,13 +492,18 @@ def _export_quantized_weight(
             weights_scaling_factor_2=weight_scale_2,
         )[0]
 
-        quantized_weight = to_quantized_weight(
+        result = to_quantized_weight(
             weight.to(dtype),
             weight_scale,
             quantization_format,
             weight_scale_2,
             block_size,
         )
+        # Handle MXFP8 which returns (weight, scale) tuple to ensure consistency
+        if isinstance(result, tuple):
+            quantized_weight, weight_scale = result
+        else:
+            quantized_weight = result
 
         quantized_weight, weight_scale = maybe_transpose_expert_weight_dimensions(
             quantized_weight, weight_scale, is_bmm_expert_weight=is_bmm_expert_weight
@@ -509,26 +514,36 @@ def _export_quantized_weight(
             weight, is_bmm_expert_weight=is_bmm_expert_weight
         )
 
-        quantized_weight = to_quantized_weight(
+        result = to_quantized_weight(
             weight.to(dtype),
             weight_scale,
             quantization_format,
             weight_scale_2,
             block_size,
         )
+        # Handle MXFP8 which returns (weight, scale) tuple to ensure consistency
+        if isinstance(result, tuple):
+            quantized_weight, weight_scale = result
+        else:
+            quantized_weight = result
 
         # Transpose back to original BMM format
         quantized_weight, _ = maybe_transpose_expert_weight_dimensions(
             quantized_weight, is_bmm_expert_weight=is_bmm_expert_weight
         )
     else:
-        quantized_weight = to_quantized_weight(
+        result = to_quantized_weight(
             weight.to(dtype),
             weight_scale,
             quantization_format,
             weight_scale_2,
             block_size,
         )
+        # Handle MXFP8 which returns (weight, scale) tuple to ensure consistency
+        if isinstance(result, tuple):
+            quantized_weight, weight_scale = result
+        else:
+            quantized_weight = result
 
     setattr(sub_module, weight_name, nn.Parameter(quantized_weight, requires_grad=False))
 
