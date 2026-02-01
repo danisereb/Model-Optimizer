@@ -185,6 +185,9 @@ class MXFP8QTensor(BaseQuantizedTensor):
         scale_factor_expanded = scale_factor.unsqueeze(-1)
         scaled_weight = weight_reshaped * scale_factor_expanded
         scaled_weight = torch.clamp(scaled_weight, min=-cls.E4M3_MAX, max=cls.E4M3_MAX)
+        # NOTE: PyTorch's .to(float8_e4m3fn) may produce different bit patterns than
+        # TRT-LLM/FlashInfer GPU kernels, which can cause accuracy issues with CUTLASS GEMM.
+        # For CUTLASS-compatible checkpoints, use the quantize() method with use_flashinfer=True.
         quantized_weight = scaled_weight.to(torch.float8_e4m3fn)
 
         return quantized_weight.view(weight.shape)
@@ -194,6 +197,7 @@ class MXFP8QTensor(BaseQuantizedTensor):
         cls,
         input: torch.Tensor,
         weights_scaling_factor: torch.Tensor | None = None,
+        use_flashinfer: bool = True,
     ) -> tuple:
         """Convert a tensor to MXFP8 quantized format.
 
@@ -202,6 +206,10 @@ class MXFP8QTensor(BaseQuantizedTensor):
             weights_scaling_factor (torch.Tensor | None): Optional pre-computed E8M0 scale
                 as uint8 biased exponent. If None, the scale will be computed from the input.
                 Shape should be [..., in_dim // 32] matching input dimensions.
+            use_flashinfer (bool): If True and FlashInfer is available, use FlashInfer's
+                mxfp8_quantize GPU kernel for CUTLASS-compatible FP8 values. This produces
+                FP8 bit patterns that work correctly with FlashInfer's mm_mxfp8 CUTLASS kernel.
+                Recommended for inference with vLLM/FlashInfer. Default: False.
 
         Returns:
             tuple: (MXFP8QTensor, weights_scaling_factor) where weights_scaling_factor is
@@ -212,6 +220,34 @@ class MXFP8QTensor(BaseQuantizedTensor):
 
         input = reduce_block_padding(input, block_sizes={-1: cls.BLOCK_SIZE})
 
+        # Use FlashInfer's GPU kernel for CUTLASS-compatible FP8 values
+        if use_flashinfer and input.is_cuda and weights_scaling_factor is None:
+            try:
+                from flashinfer import mxfp8_quantize
+
+                # Ensure input is in supported dtype
+                quant_input = input
+                if input.dtype not in (torch.float16, torch.bfloat16):
+                    quant_input = input.to(torch.bfloat16)
+
+                # FlashInfer's mxfp8_quantize returns FP8 values and E8M0 scales
+                quantized_data, scale_1d = mxfp8_quantize(
+                    quant_input,
+                    is_sf_swizzled_layout=False,  # Linear layout for compatibility
+                )
+
+                # Reshape scale from 1D to match input dimensions
+                scale_shape = (*input.shape[:-1], input.shape[-1] // cls.BLOCK_SIZE)
+                weights_scaling_factor = scale_1d.view(scale_shape)
+
+                # Crop back to original shape
+                quantized_data = quantized_data[..., : original_shape[-1]]
+
+                return cls(original_shape, original_dtype, quantized_data), weights_scaling_factor
+            except ImportError:
+                pass  # Fall back to PyTorch implementation
+
+        # Fallback: PyTorch implementation
         if weights_scaling_factor is None:
             input_amax = reduce_block_amax(input, block_sizes={-1: cls.BLOCK_SIZE})
             e8m0_exponent = cls._compute_e8m0_exponent(input_amax)
