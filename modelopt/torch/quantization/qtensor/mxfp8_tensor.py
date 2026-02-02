@@ -271,6 +271,61 @@ class MXFP8QTensor(BaseQuantizedTensor):
         return quantized_weight.view(weight.shape), weights_scaling_factor
 
     @classmethod
+    def quantize_swizzled(
+        cls,
+        weight: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize weight tensor with SWIZZLED scales for FlashInfer mm_mxfp8 CUTLASS kernel.
+
+        This method is specifically designed for vLLM/FlashInfer compatibility.
+        The mm_mxfp8 CUTLASS kernel requires scales in F8_128x4 swizzled layout.
+
+        Args:
+            weight: The weight tensor to quantize. Must be 2D [out_features, in_features].
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]: (quantized_weight, swizzled_scale)
+                - quantized_weight: FP8 E4M3 values with same shape as input
+                - swizzled_scale: 1D uint8 tensor in F8_128x4 swizzled layout
+                  for direct use with FlashInfer mm_mxfp8
+
+        Raises:
+            ImportError: If FlashInfer is not available.
+            ValueError: If weight is not 2D or dimensions are invalid.
+        """
+        if weight.dim() != 2:
+            raise ValueError(f"quantize_swizzled requires 2D weight, got {weight.dim()}D")
+
+        _, in_features = weight.shape
+        if in_features % cls.BLOCK_SIZE != 0:
+            raise ValueError(
+                f"Weight K dimension ({in_features}) must be divisible by "
+                f"MXFP8 block size ({cls.BLOCK_SIZE})"
+            )
+
+        try:
+            from flashinfer import mxfp8_quantize
+        except ImportError:
+            raise ImportError(
+                "FlashInfer is required for quantize_swizzled. Install with: pip install flashinfer"
+            )
+
+        # Ensure weight is in supported dtype and contiguous
+        quant_input = weight.contiguous()
+        if quant_input.dtype not in (torch.float16, torch.bfloat16):
+            quant_input = quant_input.to(torch.bfloat16)
+
+        # Use FlashInfer's mxfp8_quantize with SWIZZLED layout
+        # This produces scales in F8_128x4 layout required by mm_mxfp8 CUTLASS kernel
+        quantized_weight, swizzled_scale = mxfp8_quantize(
+            quant_input,
+            is_sf_swizzled_layout=True,  # SWIZZLED for CUTLASS mm_mxfp8!
+        )
+        torch.cuda.synchronize()
+
+        return quantized_weight, swizzled_scale
+
+    @classmethod
     def quantize(
         cls,
         input: torch.Tensor,

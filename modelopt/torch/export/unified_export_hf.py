@@ -428,12 +428,41 @@ def _export_quantized_weight(
             )
             del weight_quantizer._scale
         elif quantization_format == QUANTIZATION_MXFP8:
-            # MXFP8 uses dynamic block quantization with E8M0 scales (uint8)
+            # MXFP8: Export ONLY swizzled scales for FlashInfer mm_mxfp8 CUTLASS kernel.
+            # This avoids re-quantization at load time and preserves accuracy.
+            # vLLM can unswizzle if needed for torch fallback.
             weight = getattr(sub_module, weight_name)
-            e8m0_scale = MXFP8QTensor.get_weights_scaling_factor_from_quantizer(
-                weight, weight_quantizer
-            )
-            sub_module.register_buffer(quantizer_attrs.weight_scale, e8m0_scale)
+
+            if weight.is_cuda and weight.dim() == 2:
+                try:
+                    # Use FlashInfer to produce BOTH FP8 values AND swizzled scales
+                    # This ensures they are always consistent
+                    fp8_weight, swizzled_scale = MXFP8QTensor.quantize_swizzled(weight)
+
+                    # Update the weight with FlashInfer-quantized values
+                    setattr(sub_module, weight_name, nn.Parameter(fp8_weight, requires_grad=False))
+
+                    # Export only swizzled scales
+                    sub_module.register_buffer(quantizer_attrs.weight_scale, swizzled_scale)
+                except Exception as e:
+                    # Fall back to non-swizzled scales if FlashInfer fails
+                    import logging
+
+                    logging.getLogger(__name__).warning(
+                        f"FlashInfer quantize_swizzled failed: {e}. "
+                        f"Falling back to non-swizzled scales."
+                    )
+                    e8m0_scale = MXFP8QTensor.get_weights_scaling_factor_from_quantizer(
+                        weight, weight_quantizer
+                    )
+                    sub_module.register_buffer(quantizer_attrs.weight_scale, e8m0_scale)
+            else:
+                # Non-CUDA or non-2D weight: use non-swizzled scales
+                e8m0_scale = MXFP8QTensor.get_weights_scaling_factor_from_quantizer(
+                    weight, weight_quantizer
+                )
+                sub_module.register_buffer(quantizer_attrs.weight_scale, e8m0_scale)
+
             if hasattr(weight_quantizer, "_scale") and weight_quantizer._scale is not None:
                 del weight_quantizer._scale
         else:
